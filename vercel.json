@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "functions": {
+    "app/api/mcp/[transport]/route.ts": {
+      "maxDuration": 800
+    }
+  },
+  "headers": [
+    {
+      "source": "/.well-known/oauth-protected-resource",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=300" }
+      ]
+    }
+  ]
+}
