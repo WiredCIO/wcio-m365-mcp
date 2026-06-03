@@ -6,12 +6,13 @@
  * dispatches based on that path segment.
  *
  * Every request is wrapped in withMcpAuth, which validates the Bearer token
- * via verifyEntraToken. Failed auth returns 401 with a WWW-Authenticate
- * header pointing at our protected-resource metadata endpoint, which in turn
- * points MCP clients (like Claude.ai) at Microsoft's authorization server.
+ * via verifyMcpToken. Failed auth returns 401 with a WWW-Authenticate header
+ * pointing at our protected-resource metadata endpoint, which points MCP
+ * clients (like Claude.ai) at our own authorization server (a proxy in front
+ * of Microsoft Entra).
  */
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
-import { verifyEntraToken } from "@/lib/auth";
+import { verifyMcpToken } from "@/lib/auth";
 import { registerAllTools } from "@/lib/tools";
 
 export const dynamic = "force-dynamic";
@@ -33,7 +34,7 @@ const handler = createMcpHandler(
   }
 );
 
-const authHandler = withMcpAuth(handler, verifyEntraToken, {
+const authHandler = withMcpAuth(handler, verifyMcpToken, {
   required: true,
   // We don't enforce specific scopes at the transport layer — each tool can
   // check the scopes it needs from the AuthInfo passed in its handler context.

@@ -8,8 +8,9 @@
  *  2. Its auth provider pattern doesn't compose well with per-request tokens
  *  3. Direct fetch gives us better control over streaming for large uploads
  */
-import { GRAPH_BASE, TOKEN_ENDPOINT, VERBOSE, env } from "./env";
-import { createHash } from "crypto";
+import { GRAPH_BASE, VERBOSE } from "./env";
+import { refreshGraphTokens } from "./entra";
+import { decrypt, encrypt, getSession, putSession, type Session } from "./store";
 
 export class GraphError extends Error {
   constructor(
@@ -24,101 +25,49 @@ export class GraphError extends Error {
 }
 
 // ============================================================================
-// On-Behalf-Of (OBO) token exchange
+// Session -> Graph token resolution
 // ============================================================================
-// We receive a Bearer token scoped to our app (audience = our client ID).
-// To call Microsoft Graph, we need a Graph-audience token. The OBO grant
-// type exchanges the user's app-scoped token for a Graph-scoped token,
-// preserving the user's identity throughout.
-//
-// Cache strategy: in-memory keyed by SHA-256 of the incoming user token.
-// Vercel warm functions reuse this map across requests; cold starts lose
-// it and we do a fresh exchange. Tokens are cached until ~5 minutes before
-// their declared expiry to avoid races.
+// Tool handlers pass us an opaque session id (carried through AuthInfo). We
+// resolve it to a live Microsoft Graph access token, transparently refreshing
+// via the stored Entra refresh token when the cached one is near expiry. The
+// OBO flow is gone — the proxy obtained Graph tokens directly during login.
 
-interface CachedGraphToken {
-  graphToken: string;
-  expiresAt: number; // epoch millis
-}
-
-const graphTokenCache = new Map<string, CachedGraphToken>();
 const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 
-function cacheKey(userToken: string): string {
-  return createHash("sha256").update(userToken).digest("hex");
-}
-
 /**
- * Exchange the user's app-scoped token for a Microsoft Graph-scoped token
- * using OAuth 2.0 On-Behalf-Of grant. Cached per user-token for ~55 minutes.
- *
- * Requests Graph's `.default` scope, which yields a token containing every
- * delegated permission our app registration has admin-consented for the
- * user — so we don't need per-tool scope arguments.
- *
- * https://learn.microsoft.com/entra/identity-platform/v2-oauth2-on-behalf-of-flow
+ * Resolve a session id to a valid Graph access token. Refreshes through Entra
+ * (refresh_token grant) and re-persists the rotated tokens when needed.
  */
-export async function exchangeForGraphToken(userToken: string): Promise<string> {
-  const key = cacheKey(userToken);
-  const cached = graphTokenCache.get(key);
+export async function getGraphTokenForSession(sessionId: string): Promise<string> {
+  const session = await getSession(sessionId);
+  if (!session) {
+    throw new GraphError("Session not found or expired — re-authentication required", 401);
+  }
+
   const now = Date.now();
-  if (cached && cached.expiresAt - TOKEN_REFRESH_BUFFER_MS > now) {
-    return cached.graphToken;
+  if (session.graphExpiresAt - TOKEN_REFRESH_BUFFER_MS > now) {
+    return decrypt(session.graphAccessTokenEnc);
   }
 
-  const body = new URLSearchParams({
-    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-    client_id: env.WCIO_MCP_CLIENT_ID,
-    client_secret: env.WCIO_MCP_CLIENT_SECRET,
-    assertion: userToken,
-    scope: "https://graph.microsoft.com/.default offline_access",
-    requested_token_use: "on_behalf_of",
-  });
-
-  const res = await fetch(TOKEN_ENDPOINT, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
-
-  if (!res.ok) {
-    let detail = "";
-    try {
-      const errJson = (await res.json()) as { error?: string; error_description?: string };
-      detail = `${errJson.error ?? "unknown_error"}: ${errJson.error_description ?? ""}`;
-    } catch {
-      detail = await res.text();
-    }
-    throw new GraphError(
-      `OBO token exchange failed: ${detail}`,
-      res.status,
-      "obo_exchange_failed"
-    );
+  // Access token expired (or close to it) — refresh via Entra.
+  let tokens;
+  try {
+    tokens = await refreshGraphTokens(decrypt(session.graphRefreshTokenEnc));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new GraphError(`Token refresh failed — re-authentication required: ${msg}`, 401);
   }
 
-  const tokenResponse = (await res.json()) as {
-    access_token: string;
-    expires_in: number;
-    token_type: string;
+  const updated: Session = {
+    ...session,
+    graphAccessTokenEnc: encrypt(tokens.accessToken),
+    graphRefreshTokenEnc: encrypt(tokens.refreshToken),
+    graphExpiresAt: now + tokens.expiresIn * 1000,
   };
+  await putSession(updated);
 
-  graphTokenCache.set(key, {
-    graphToken: tokenResponse.access_token,
-    expiresAt: now + tokenResponse.expires_in * 1000,
-  });
-
-  if (VERBOSE) {
-    console.log(`[obo] exchanged user token for Graph token, valid ${tokenResponse.expires_in}s`);
-  }
-
-  // Periodic cleanup so the cache doesn't grow unboundedly on a warm instance
-  if (graphTokenCache.size > 200) {
-    for (const [k, v] of graphTokenCache.entries()) {
-      if (v.expiresAt < now) graphTokenCache.delete(k);
-    }
-  }
-
-  return tokenResponse.access_token;
+  if (VERBOSE) console.log(`[graph] refreshed token for session ${sessionId.slice(0, 8)}…`);
+  return tokens.accessToken;
 }
 
 interface GraphErrorBody {
@@ -133,16 +82,16 @@ interface GraphErrorBody {
 }
 
 /**
- * Make a Graph API request. Accepts the user's MCP-scoped Bearer token;
- * internally exchanges it for a Graph-scoped token via OBO before calling.
+ * Make a Graph API request. Accepts the caller's opaque session id and
+ * resolves it to a live Graph token (refreshing if needed) before calling.
  * Returns parsed JSON on success. Throws GraphError with HTTP status on failure.
  */
 export async function graph<T = unknown>(
-  userToken: string,
+  sessionId: string,
   path: string,
   init: RequestInit = {}
 ): Promise<T> {
-  const graphToken = await exchangeForGraphToken(userToken);
+  const graphToken = await getGraphTokenForSession(sessionId);
   const url = path.startsWith("http") ? path : `${GRAPH_BASE}${path}`;
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${graphToken}`);
@@ -187,15 +136,15 @@ export async function graph<T = unknown>(
 
 /**
  * Upload binary content to Graph. Used for file uploads under 4 MB.
- * Takes the user's MCP-scoped token; internally exchanges to Graph.
+ * Takes the caller's session id; resolves it to a Graph token internally.
  */
 export async function graphPutBinary(
-  userToken: string,
+  sessionId: string,
   path: string,
   body: ArrayBuffer | Uint8Array | Blob,
   contentType: string = "application/octet-stream"
 ): Promise<unknown> {
-  const graphToken = await exchangeForGraphToken(userToken);
+  const graphToken = await getGraphTokenForSession(sessionId);
   const url = path.startsWith("http") ? path : `${GRAPH_BASE}${path}`;
   const res = await fetch(url, {
     method: "PUT",
@@ -226,21 +175,21 @@ export async function graphPutBinary(
 
 /**
  * Upload a file >4 MB using an upload session.
- * Takes the user's MCP-scoped token; exchanges via OBO for the session-create
- * call. The actual chunked PUTs use the temporary uploadUrl Microsoft returns,
- * which is pre-authenticated so no token needed on those.
+ * Takes the caller's session id; resolves it to a Graph token for the
+ * session-create call. The actual chunked PUTs use the temporary uploadUrl
+ * Microsoft returns, which is pre-authenticated so no token needed on those.
  *
  * https://learn.microsoft.com/graph/api/driveitem-createuploadsession
  */
 export async function uploadFileViaSession(
-  userToken: string,
+  sessionId: string,
   uploadSessionPath: string,
   body: ArrayBuffer,
   conflictBehavior: "rename" | "replace" | "fail" = "replace"
 ): Promise<unknown> {
-  // 1. Create the upload session (needs Graph token via OBO)
+  // 1. Create the upload session (resolves the session id to a Graph token)
   const session = (await graph<{ uploadUrl: string }>(
-    userToken,
+    sessionId,
     uploadSessionPath,
     {
       method: "POST",

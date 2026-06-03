@@ -13,6 +13,7 @@
   "dependencies": {
     "@microsoft/microsoft-graph-client": "^3.0.7",
     "@modelcontextprotocol/sdk": "^1.0.4",
+    "@upstash/redis": "^1.38.0",
     "isomorphic-fetch": "^3.0.0",
     "jose": "^5.9.6",
     "mcp-handler": "^1.0.0",

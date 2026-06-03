@@ -15,7 +15,7 @@ Required role: Application Administrator or Global Administrator in your Entra t
 3. Fill in:
    - **Name**: `Wired CIO M365 MCP`
    - **Supported account types**: **Accounts in this organizational directory only (Wired CIO only — single tenant)**
-   - **Redirect URI** — leave blank for now. You'll add Claude.ai's callback URL once you have the MCP server deployed.
+   - **Redirect URI** — leave blank for now. You'll add the MCP server's own callback URL (`<base>/api/oauth/callback`) once it's deployed. (This server fronts Entra with its own OAuth authorization server, so Entra redirects back to *us*, not directly to Claude.)
 4. Click **Register**.
 
 Save these values from the Overview page — you'll need them for Vercel env vars:
@@ -64,17 +64,23 @@ Once consented, every user in the tenant can authenticate without their own cons
 ## 3. Authentication settings
 
 1. In the app, open **Authentication** → **Add a platform** → **Web**.
-2. **Redirect URIs** — add Claude.ai's callback. The current value for claude.ai is:
+2. **Redirect URIs** — add **this MCP server's** callback (NOT Claude's). It is your base URL plus `/api/oauth/callback`, e.g.:
    ```
-   https://claude.ai/api/mcp/auth_callback
+   https://wcio-m365-mcp.vercel.app/api/oauth/callback
    ```
-   Confirm the current Claude callback URL via [Anthropic's MCP docs](https://docs.claude.com/) before saving — Anthropic occasionally adds new ones for new regions or product surfaces.
+   Entra redirects here after the user signs in; the server then completes the
+   flow back to Claude. If you use a custom domain, register that domain's
+   callback instead (and update `WCIO_MCP_BASE_URL` to match).
 
 3. **Front-channel logout URL** — leave blank.
 4. **Implicit grant and hybrid flows** — leave both unchecked. We use authorization code with PKCE only.
 5. Under **Advanced settings**:
-   - **Allow public client flows**: **No**
+   - **Allow public client flows**: **No** (this is a confidential client — it authenticates to Entra with a client secret).
 6. Click **Configure / Save**.
+
+> You do **not** need to configure "Expose an API" / an Application ID URI. The
+> server requests Microsoft Graph scopes directly during the server-side
+> authorization-code exchange; there is no custom API audience to expose.
 
 ---
 
@@ -100,28 +106,45 @@ This makes the consent screen look professional when users first authenticate.
 
 ## 6. Capture values for Vercel
 
-You'll need three values to set in Vercel environment variables:
+Set these in Vercel → Project → Settings → Environment Variables:
 
 | Vercel env var | Where to find it |
 |---|---|
 | `WCIO_MCP_TENANT_ID` | App registration → Overview → Directory (tenant) ID |
 | `WCIO_MCP_CLIENT_ID` | App registration → Overview → Application (client) ID |
+| `WCIO_MCP_CLIENT_SECRET` | App registration → Certificates & secrets → New client secret → copy the **Value** |
 | `WCIO_MCP_BASE_URL` | The Vercel deployment URL once you deploy (next doc) |
+| `WCIO_MCP_TOKEN_ENCRYPTION_KEY` | Generate locally: `openssl rand -base64 32` |
 
-No client secret is needed — the MCP server is a public OAuth client that uses PKCE.
+A **client secret is required** — this server is a confidential OAuth client. It
+runs the authorization-code and refresh-token exchanges with Entra server-side
+(Claude never talks to Entra directly), which is what lets us avoid Entra's
+`resource`+`scope` rejection (AADSTS9010010) and work around Entra's lack of
+dynamic client registration.
+
+You also need a **Redis store** for OAuth state, sessions, and (encrypted)
+refresh tokens: in Vercel go to **Storage → add a Redis (Upstash) integration**
+and connect it to this project. It injects the `KV_REST_API_URL` /
+`KV_REST_API_TOKEN` env vars automatically.
 
 ---
 
 ## Common gotchas
 
-**"AADSTS500113: No reply address is registered"**
-The redirect URI in the app registration doesn't match what Claude.ai is sending. Confirm the callback URL value exactly, including trailing slashes or lack thereof.
+**"AADSTS500113: No reply address is registered"** / **"AADSTS50011: redirect URI mismatch"**
+The redirect URI in the app registration doesn't exactly match `<WCIO_MCP_BASE_URL>/api/oauth/callback`. Confirm the value character-for-character (scheme, host, path, no stray trailing slash) and that `WCIO_MCP_BASE_URL` matches your actual deployment URL.
+
+**"AADSTS9010010: resource parameter doesn't match the requested scopes"**
+This is the failure this proxy design exists to prevent. If you see it, something is sending Claude directly to Entra again — confirm `/.well-known/oauth-protected-resource` lists **this server's** base URL under `authorization_servers` (not `login.microsoftonline.com`), and that the connector in Claude was re-added after deploying.
 
 **"AADSTS65001: The user or administrator has not consented"**
 Admin consent wasn't granted, or was granted before all required permissions were added. Re-run **Grant admin consent for Wired CIO** in the API permissions blade.
 
-**Tokens validate but Graph calls return 403**
+**"invalid_grant" / "offline_access" errors at the callback**
+The server needs a refresh token from Entra. Ensure `offline_access` is in the granted delegated permissions (section 2) and admin consent has been re-run.
+
+**Graph calls return 403**
 The user account doesn't have access to the resource being requested (e.g. a SharePoint site they aren't a member of). Delegated permissions are gated by the user's effective access, not just the app's declared permissions.
 
-**Tokens validate but the MCP server rejects them**
-Check that `aud` claim equals `https://graph.microsoft.com` or `00000003-0000-0000-c000-000000000000`. If you see a custom audience, the OAuth flow isn't requesting Graph scopes correctly — likely a scope formatting issue in Claude.ai's request.
+**Connecting fails immediately with a 500 before any sign-in prompt**
+Usually a missing env var. All of `WCIO_MCP_CLIENT_SECRET`, `WCIO_MCP_TOKEN_ENCRYPTION_KEY`, and the Redis integration vars must be set — the server validates them at boot and every route fails fast if any are absent.

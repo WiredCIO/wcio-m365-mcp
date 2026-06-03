@@ -10,9 +10,11 @@ Read this before making structural changes.
 1. **Per-user identity**: every Graph API call runs as the user who initiated
    the AI conversation. Their name appears in audit logs. They can only
    access what they're permitted to access.
-2. **No token storage on our server**: we are a stateless proxy. Tokens flow
-   through; we never persist them. If our server is compromised, no historical
-   credentials leak.
+2. **Be our own OAuth authorization server**: Claude talks OAuth only to us;
+   we talk to Microsoft Entra server-side. This is what lets us work around
+   two Entra limitations at once — no Dynamic Client Registration, and the
+   `resource`+`scope` rejection (AADSTS9010010). Entra tokens never reach
+   Claude; they live encrypted on our side and we hand Claude an opaque Bearer.
 3. **Single deployment, org-wide use**: one Entra app, one Vercel deployment,
    one URL that anyone in the tenant can connect to.
 4. **Composable with the existing read-only M365 connector**: the read side
@@ -23,37 +25,55 @@ Read this before making structural changes.
 
 ## Request flow
 
+We act as an OAuth 2.1 authorization server (Authorization Code + PKCE, with
+Dynamic Client Registration) that proxies Microsoft Entra. Claude registers
+with us, authorizes against us, and exchanges codes with us. Behind the
+scenes we run the real authorization-code and refresh-token exchanges with
+Entra as a confidential client, and we keep the Entra tokens encrypted in
+Redis. Claude only ever holds an opaque Bearer that maps to a server session.
+
 ### Initial OAuth setup (once per user, per device)
 
 ```
-User           Claude.ai             Our MCP            Microsoft Entra
- │                │                    │                    │
- │ "add connector"│                    │                    │
- │───────────────►│                    │                    │
- │                │ GET /.well-known/oauth-protected-resource
- │                │───────────────────►│                    │
- │                │  authorization_servers: [Entra/{tid}/v2.0]
- │                │◄───────────────────│                    │
- │                │                    │                    │
- │                │ GET /.well-known/openid-configuration   │
- │                │────────────────────────────────────────►│
- │                │  authorization_endpoint, token_endpoint │
- │                │◄────────────────────────────────────────│
- │                │                    │                    │
- │   browser redirect to authorization_endpoint w/ PKCE     │
- │◄─────────────────────────────────────────────────────────│
- │   sign in (Microsoft Entra)                              │
- │─────────────────────────────────────────────────────────►│
- │                │                    │                    │
- │   redirect to claude.ai/api/mcp/auth_callback?code=...   │
- │◄─────────────────────────────────────────────────────────│
- │                │ POST token_endpoint w/ code + PKCE      │
- │                │────────────────────────────────────────►│
- │                │  access_token, refresh_token            │
- │                │◄────────────────────────────────────────│
- │                │                    │                    │
- │                │ stores tokens in Claude.ai's user storage
- │                │                    │                    │
+User        Claude.ai            Our MCP (Auth Server)        Microsoft Entra
+ │             │                       │                          │
+ │"add conn."  │                       │                          │
+ │────────────►│                       │                          │
+ │             │ GET /.well-known/oauth-protected-resource        │
+ │             │──────────────────────►│                          │
+ │             │  authorization_servers: [<our base URL>]         │
+ │             │◄──────────────────────│                          │
+ │             │ GET /.well-known/oauth-authorization-server      │
+ │             │──────────────────────►│                          │
+ │             │  authorize/token/registration endpoints (ours)   │
+ │             │◄──────────────────────│                          │
+ │             │ POST /api/oauth/register (DCR)                    │
+ │             │──────────────────────►│  → client_id             │
+ │             │◄──────────────────────│                          │
+ │             │ GET /api/oauth/authorize?code_challenge=… (PKCE) │
+ │             │──────────────────────►│                          │
+ │             │        302 to Entra authorize (our PKCE,         │
+ │             │        scope=…/.default, NO resource param)      │
+ │             │◄──────────────────────│                          │
+ │   browser redirect to Entra; user signs in                     │
+ │◄───────────────────────────────────────────────────────────────│
+ │───────────────────────────────────────────────────────────────►│
+ │             │   302 to /api/oauth/callback?code=…&state=…       │
+ │             │◄─────────────────────────────────────────────────│
+ │             │                       │ POST Entra /token        │
+ │             │                       │ (client_secret + PKCE,   │
+ │             │                       │  NO resource param)      │
+ │             │                       │─────────────────────────►│
+ │             │                       │  access + refresh token  │
+ │             │                       │◄─────────────────────────│
+ │             │                       │ encrypt tokens → session │
+ │             │                       │ mint our one-time code   │
+ │             │  302 to Claude redirect_uri?code=<ours>&state    │
+ │             │◄──────────────────────│                          │
+ │             │ POST /api/oauth/token (our code + PKCE verifier)  │
+ │             │──────────────────────►│  → opaque Bearer + refresh│
+ │             │◄──────────────────────│                          │
+ │             │ stores OUR opaque tokens in Claude's user storage│
 ```
 
 ### Tool invocation (every MCP request)
@@ -62,22 +82,23 @@ User           Claude.ai             Our MCP            Microsoft Entra
 Claude.ai                  Our MCP                Microsoft Graph
     │                        │                        │
     │ POST /api/mcp/mcp       │                        │
-    │ Authorization: Bearer X │                        │
+    │ Authorization: Bearer O │  (O = our opaque token)│
     │────────────────────────►│                        │
     │                        │                        │
-    │     verifyEntraToken(X):                         │
-    │      - fetch JWKS from Entra (cached)            │
-    │      - verify signature                          │
-    │      - check iss = our tenant                    │
-    │      - check aud = Graph                         │
-    │      - check tid = our tenant                    │
-    │     → AuthInfo {token: X, scopes, userId}        │
+    │     verifyMcpToken(O):                           │
+    │      - sha256(O) → look up access-token ref      │
+    │      - check not expired                         │
+    │      - load session (encrypted Graph tokens)     │
+    │     → AuthInfo {sessionId, userId, scopes}       │
     │                        │                        │
     │     tool handler called with AuthInfo            │
-    │     extracts accessToken                         │
+    │     getGraphTokenForSession(sessionId):          │
+    │      - decrypt Graph access token                │
+    │      - if within 5 min of expiry, refresh via    │
+    │        Entra (client_secret), re-encrypt, store  │
     │                        │                        │
     │                        │ Graph API call         │
-    │                        │ Authorization: Bearer X │
+    │                        │ Authorization: Bearer G │  (G = real Graph token)
     │                        │───────────────────────►│
     │                        │  result                │
     │                        │◄───────────────────────│
@@ -86,9 +107,10 @@ Claude.ai                  Our MCP                Microsoft Graph
     │◄────────────────────────│                        │
 ```
 
-When the token expires (typically 1 hour), Claude.ai uses the refresh_token
-to get a new one transparently. The MCP server doesn't participate in refresh
-— it just validates whatever token shows up in the next call.
+When our opaque access token expires (1 hour), Claude uses the refresh token
+we issued to get a new pair from `/api/oauth/token` — that maps back to the
+same session. Separately, the underlying Graph token is refreshed against
+Entra on demand inside `getGraphTokenForSession`, transparently to Claude.
 
 ---
 
@@ -98,17 +120,28 @@ to get a new one transparently. The MCP server doesn't participate in refresh
 app/
 ├── api/
 │   ├── mcp/[transport]/route.ts       # MCP HTTP endpoint (POST/GET/DELETE)
+│   ├── oauth/
+│   │   ├── register/route.ts          # Dynamic Client Registration (RFC 7591)
+│   │   ├── authorize/route.ts         # our /authorize → 302 to Entra
+│   │   ├── callback/route.ts          # Entra redirect target; mints our code
+│   │   └── token/route.ts             # our /token (auth_code + refresh_token)
 │   └── health/route.ts                # liveness check
 ├── .well-known/
-│   └── oauth-protected-resource/      # OAuth metadata for client discovery
+│   ├── oauth-protected-resource/      # RFC 9728: points clients at us as AS
+│   │   └── route.ts
+│   └── oauth-authorization-server/    # RFC 8414: our AS metadata
 │       └── route.ts
 ├── layout.tsx                         # Next.js shell
 └── page.tsx                           # public landing page
 
 lib/
 ├── env.ts                             # env parsing, constants
-├── auth.ts                            # JWT verification, AuthInfo
-├── graph.ts                           # fetch helpers for Graph API
+├── oauth.ts                           # PKCE, token gen, redirect-uri checks
+├── store.ts                           # Upstash Redis: clients/sessions/codes,
+│                                      #   AES-256-GCM token encryption
+├── entra.ts                           # server-side code/refresh exchange w/ Entra
+├── auth.ts                            # opaque Bearer → session (verifyMcpToken)
+├── graph.ts                           # Graph fetch helpers + per-session token
 └── tools/
     ├── index.ts                       # tool registration aggregator
     ├── files.ts                       # OneDrive / SharePoint write tools
@@ -128,45 +161,90 @@ handlers. We get:
 
 We don't use the React rendering features other than the minimal landing page.
 
-### Why no client secret?
+### Why are we our own authorization server (the proxy)?
 
-OAuth 2.1 with PKCE doesn't require a confidential client. PKCE protects the
-authorization code from interception. A confidential client would buy us
-client authentication during the token exchange — but since our server isn't
-exchanging codes (Claude.ai is), the protection wouldn't apply to us anyway.
+Two hard Entra constraints forced this design:
 
-This also means there's no secret to leak from our codebase. The Entra
-client ID is public information.
+1. **No Dynamic Client Registration.** Claude expects to register itself with
+   the authorization server at connect time (RFC 7591). Entra has no public
+   DCR endpoint, so Claude could never get a `client_id` directly from Entra.
+   By being the AS ourselves, we implement DCR and hand Claude a client_id.
+2. **Entra rejects `resource`+`scope` together (AADSTS9010010).** When Claude
+   drives the flow directly, it sends both a `resource` indicator (RFC 8707)
+   and Graph scopes; Entra's v2.0 endpoint rejects that combination
+   (`invalid_target`). By taking Claude out of the direct Entra path, *we*
+   shape the Entra request — Graph `.default` scope, **no** `resource` param —
+   so Entra is happy.
 
-### Why pass-through tokens instead of on-behalf-of (OBO)?
+Claude does PKCE against *us*; we do a second, independent PKCE leg against
+Entra. Entra tokens never leave our server.
 
-OBO would let our server act with an extended audience by exchanging the
-user's token for a different one. We'd need a client secret for that, plus
-additional Entra config. For our use case (Graph API only), pass-through is
-strictly simpler and equally functional. If we later needed to call a
-different API beyond Graph, OBO might become attractive.
+### Why a client secret now?
+
+Because we are the party exchanging authorization codes and refresh tokens
+with Entra (server-side), we are a **confidential client** and must
+authenticate to Entra's token endpoint with `WCIO_MCP_CLIENT_SECRET`. This is
+the opposite of the earlier public-client/PKCE-only design — and it's exactly
+what lets us run the code/refresh exchanges that keep Graph tokens off Claude.
+
+### Why drop on-behalf-of (OBO)?
+
+An earlier iteration tried OBO (exchange the user's inbound token for a Graph
+token). With the proxy we request Graph delegated scopes **directly** during
+the server-side authorization-code exchange, so there is no inbound user token
+to exchange and no OBO leg. Simpler, fewer Entra round-trips, and it sidesteps
+the same `resource`/audience pitfalls. If we ever need a second downstream API
+beyond Graph, we'd request its scopes in the same exchange (or revisit OBO).
 
 ---
 
 ## Security model
 
+This is now a stateful authorization server that holds Entra tokens, so the
+security model is meaningfully different from the old stateless proxy.
+
 ### What the server can do
-- Validate tokens
-- Forward authenticated requests to Graph
+- Issue and validate its own opaque Bearer tokens (mapped to sessions)
+- Run authorization-code and refresh-token exchanges with Entra (confidential client)
+- Hold Entra access + refresh tokens, **encrypted at rest** (AES-256-GCM in Redis)
+- Forward authenticated requests to Graph as the user
 - Log non-sensitive metadata (user identifier, tool name, success/failure)
 
 ### What the server cannot do
-- Act on behalf of any user without their token in the current request
-- Generate or refresh tokens
-- Access OneDrive/SharePoint/Outlook outside of a user's Graph-scoped permissions
-- Store user data persistently — every container restart is clean state
+- Act on behalf of a user with no valid session / opaque token
+- Access OneDrive/SharePoint/Outlook outside a user's Graph-scoped permissions
+  (delegated scopes are gated by the user's effective access)
+- Decrypt stored tokens without `WCIO_MCP_TOKEN_ENCRYPTION_KEY`
+- Authenticate to Entra without `WCIO_MCP_CLIENT_SECRET`
+
+### Defenses
+- **Opaque tokens, not JWTs**: Claude never receives an Entra token. Our Bearer
+  is a random 256-bit value; only its sha256 is stored, mapped to a session.
+- **PKCE on both legs**: Claude→us and us→Entra each use Authorization Code +
+  PKCE (S256). Authorization codes are one-time and expire in 60s.
+- **Tokens encrypted at rest**: Entra access/refresh tokens are sealed with
+  AES-256-GCM; the key lives only in env, never in Redis or the repo.
+- **Short TTLs + rotation**: in-flight auth requests 10 min, opaque access
+  tokens 1 h, refresh tokens rotate on use (old one consumed).
+- **Redirect-URI validation**: `/authorize` validates the client and its
+  redirect URI *before* trusting any redirect; only https or http-loopback
+  redirects are accepted at registration.
+- **Single-tenant Entra app**: only users from the configured tenant can sign in.
 
 ### What attackers can attempt
-- **Forged tokens**: blocked by JWT signature verification against Microsoft's JWKS.
-- **Token replay across tenants**: blocked by `tid` claim check.
-- **Token misuse for wrong API**: blocked by `aud` claim check (must be Graph).
-- **Compromising our server to grab tokens**: limited blast radius — we only see tokens during their ~1-hour validity, no refresh tokens, no client secret. Tokens are not logged.
-- **Prompt injection from a file/email content**: this is the AI client's responsibility, not ours. The client is expected to confirm with the user before destructive actions.
+- **Stealing the opaque Bearer**: limited to its 1-hour window and only grants
+  Graph access the user already has; it cannot be replayed against Entra
+  directly (it isn't an Entra token).
+- **Compromising Redis**: tokens there are encrypted; without the encryption
+  key they're useless. Codes/auth-requests are short-lived.
+- **Compromising the server process**: higher blast radius than the old
+  design (the key and client secret are in env, and live tokens pass through
+  memory). Mitigations: encryption at rest, no token logging, short TTLs,
+  refresh-token rotation. Rotating the encryption key invalidates all sessions.
+- **Forged authorization codes / PKCE downgrade**: blocked by one-time codes,
+  S256-only verification (`timingSafeEqual`), and client_id/redirect_uri checks.
+- **Prompt injection from file/email content**: the AI client's responsibility;
+  the client is expected to confirm with the user before destructive actions.
 
 ### Audit story
 
@@ -211,7 +289,8 @@ Things explicitly not in v1 that we may want later:
 - **Approval gates**: a tool that posts a draft to a review channel and waits
   for a human to approve before executing send_email. Requires state.
 - **Bulk operations**: batched file uploads with progress reporting.
-- **On-Behalf-Of flow**: if we add a second API beyond Graph.
+- **Additional downstream APIs beyond Graph**: request their delegated scopes
+  in the same server-side authorization-code exchange (or revisit OBO).
 - **App-only tokens** for system tasks like scheduled cleanup. Higher risk
   surface; not needed for any current use case.
 - **Webhook support**: subscribe to Graph notifications and trigger tools.

@@ -1,92 +1,59 @@
 /**
- * Validates Microsoft Entra ID access tokens.
+ * Validates the opaque Bearer tokens that *we* issued from /api/oauth/token.
  *
- * We expect tokens issued by Microsoft Entra (Azure AD) for our specific
- * tenant, with an audience matching our app's client ID (the token is
- * scoped to our MCP server, not directly to Graph). The signature is
- * checked against Microsoft's published JWKS endpoint.
- *
- * On success we return AuthInfo with the raw token in `extra.accessToken`.
- * Tool handlers pass this token to graph(), which internally exchanges it
- * for a Graph-audience token via the OBO flow.
+ * These are not Entra tokens — they're high-entropy random strings that map
+ * (via their SHA-256 hash) to a server-side session holding the user's
+ * encrypted Graph tokens. We expose the session id to tool handlers through
+ * AuthInfo.extra.accessToken; graph.ts resolves it to a live Graph token.
  */
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { env, ISSUER, APP_AUDIENCE, VERBOSE } from "./env";
-
-/**
- * Microsoft's tenant-scoped JWKS endpoint. `jose` caches keys and respects
- * cache-control headers — no manual TTL needed.
- */
-const JWKS = createRemoteJWKSet(
-  new URL(`https://login.microsoftonline.com/${env.WCIO_MCP_TENANT_ID}/discovery/v2.0/keys`)
-);
-
-interface EntraClaims extends JWTPayload {
-  /** Object ID of the user — stable identifier within the tenant. */
-  oid?: string;
-  /** Tenant ID — must match our configured tenant. */
-  tid?: string;
-  /** Space-separated delegated permissions (Graph scopes). */
-  scp?: string;
-  /** User's UPN / email for logging. */
-  upn?: string;
-  preferred_username?: string;
-  /** App ID that requested the token. */
-  appid?: string;
-  azp?: string;
-}
+import { sha256 } from "./oauth";
+import { getAccessTokenRef, getSession } from "./store";
+import { VERBOSE } from "./env";
 
 /**
  * Verify a Bearer token and return AuthInfo for the MCP request.
- * Returns `undefined` for invalid tokens, which causes mcp-handler to
+ * Returns `undefined` for invalid/expired tokens, which causes mcp-handler to
  * respond with a 401 and the WWW-Authenticate header.
  */
-export async function verifyEntraToken(
+export async function verifyMcpToken(
   _req: Request,
   bearerToken?: string
 ): Promise<AuthInfo | undefined> {
   if (!bearerToken) return undefined;
 
   try {
-    const { payload } = await jwtVerify<EntraClaims>(bearerToken, JWKS, {
-      issuer: [
-        ISSUER,
-        // v1.0 issuer format — Microsoft sometimes mixes them
-        `https://sts.windows.net/${env.WCIO_MCP_TENANT_ID}/`,
-      ],
-      audience: APP_AUDIENCE,
-    });
-
-    // Defense in depth: explicitly check tenant ID even though the issuer
-    // check above already pins us to it.
-    if (payload.tid !== env.WCIO_MCP_TENANT_ID) {
-      if (VERBOSE) {
-        console.warn(`[auth] rejected: tid mismatch (got ${payload.tid})`);
-      }
+    const ref = await getAccessTokenRef(sha256(bearerToken));
+    if (!ref) {
+      if (VERBOSE) console.warn("[auth] rejected: unknown or expired access token");
+      return undefined;
+    }
+    if (ref.expiresAt <= Date.now()) {
+      if (VERBOSE) console.warn("[auth] rejected: access token past expiry");
       return undefined;
     }
 
-    const scopes = (payload.scp ?? "").split(" ").filter(Boolean);
-    const userIdentifier =
-      payload.upn ?? payload.preferred_username ?? payload.oid ?? "unknown";
+    const session = await getSession(ref.sessionId);
+    if (!session) {
+      if (VERBOSE) console.warn("[auth] rejected: session no longer exists");
+      return undefined;
+    }
 
     if (VERBOSE) {
-      console.log(
-        `[auth] accepted token for ${userIdentifier} (scopes: ${scopes.join(",")})`
-      );
+      console.log(`[auth] accepted token for ${session.userIdentifier}`);
     }
 
     return {
       token: bearerToken,
-      clientId: payload.appid ?? payload.azp ?? "unknown",
-      scopes,
+      clientId: ref.clientId,
+      scopes: session.scopes,
       extra: {
-        // The raw token is what we forward to Graph for tool calls.
-        accessToken: bearerToken,
-        userId: payload.oid,
-        userIdentifier,
-        tenantId: payload.tid,
+        // Tool handlers read this as the handle to pass into graph(); it's the
+        // opaque session id, not a real Graph token.
+        accessToken: session.sessionId,
+        sessionId: session.sessionId,
+        userId: session.userOid,
+        userIdentifier: session.userIdentifier,
       },
     };
   } catch (err) {
@@ -99,14 +66,15 @@ export async function verifyEntraToken(
 }
 
 /**
- * Convenience: extract the access token from AuthInfo for a tool handler.
+ * Convenience: extract the session handle from AuthInfo for a tool handler.
+ * (Named getAccessToken for backward compatibility with existing tool code.)
  */
 export function getAccessToken(authInfo: AuthInfo | undefined): string {
-  const token = authInfo?.extra?.accessToken;
-  if (typeof token !== "string") {
-    throw new Error("No access token available — authentication required");
+  const handle = authInfo?.extra?.accessToken;
+  if (typeof handle !== "string") {
+    throw new Error("No session available — authentication required");
   }
-  return token;
+  return handle;
 }
 
 /**
