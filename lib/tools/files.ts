@@ -10,6 +10,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   graph,
+  graphGetBinary,
   graphPutBinary,
   uploadFileViaSession,
   userDrivePath,
@@ -194,6 +195,115 @@ export function registerFileTools(server: McpServer) {
         };
       } catch (err) {
         return errorResult("update_file", err);
+      }
+    }
+  );
+
+  // ==========================================================================
+  // download_file — read existing file content for round-trip editing
+  // ==========================================================================
+  server.tool(
+    "download_file",
+    "Download a file from OneDrive or a SharePoint site. Returns metadata " +
+      "(including a pre-signed downloadUrl valid ~1 hour) and, for files ≤ 4 MB, " +
+      "the file content as an embedded resource block (base64-encoded bytes). " +
+      "Use this before update_file to read a file's current contents.",
+    {
+      path: z
+        .string()
+        .optional()
+        .describe("Path to file. Either path OR item_id required."),
+      item_id: z
+        .string()
+        .optional()
+        .describe("Graph item ID of the file. Either path OR item_id required."),
+      site_id: z.string().optional().describe("SharePoint site ID, if not OneDrive"),
+      include_content: z
+        .boolean()
+        .default(true)
+        .describe(
+          "Embed file bytes in the response. Set false (or skip for files > 4 MB) " +
+            "and use the downloadUrl returned in metadata instead."
+        ),
+    },
+    async ({ path, item_id, site_id, include_content }, { authInfo }) => {
+      if (!path && !item_id) {
+        return {
+          content: [{ type: "text", text: "Error: provide either `path` or `item_id`" }],
+          isError: true,
+        };
+      }
+      const token = authInfo!.extra!.accessToken as string;
+      const itemRef = resolveItemRef({ siteId: site_id, path, itemId: item_id });
+
+      try {
+        // Fetch metadata first — includes @microsoft.graph.downloadUrl (a
+        // pre-signed URL valid ~1 hour, no auth required) and item details.
+        const item = (await graph(token, itemRef)) as DriveItem & {
+          "@microsoft.graph.downloadUrl"?: string;
+        };
+
+        if (item.folder) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `${item.name} is a folder, not a file. Use list_folder to enumerate ` +
+                  `its contents.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const downloadUrl = item["@microsoft.graph.downloadUrl"];
+        const sizeBytes = item.size ?? 0;
+        const mimeType = item.file?.mimeType ?? "application/octet-stream";
+
+        let summary =
+          `${item.name}\n` +
+          `  ID: ${item.id}\n` +
+          `  Size: ${formatBytes(sizeBytes)}\n` +
+          `  MIME: ${mimeType}` +
+          (downloadUrl
+            ? `\n  Pre-signed download URL (valid ~1h, no auth required):\n  ${downloadUrl}`
+            : "");
+
+        const blocks: Array<
+          | { type: "text"; text: string }
+          | {
+              type: "resource";
+              resource: { uri: string; mimeType: string; blob: string };
+            }
+        > = [];
+
+        if (include_content && sizeBytes <= SIMPLE_UPLOAD_LIMIT) {
+          // Fetch the bytes via the /content endpoint
+          const contentPath = item_id ? `${itemRef}/content` : `${itemRef}:/content`;
+          const { bytes } = await graphGetBinary(token, contentPath);
+          const b64 = Buffer.from(bytes).toString("base64");
+          blocks.push({ type: "text", text: summary });
+          blocks.push({
+            type: "resource",
+            resource: {
+              uri: `m365://drive/items/${item.id}`,
+              mimeType,
+              blob: b64,
+            },
+          });
+        } else {
+          if (include_content && sizeBytes > SIMPLE_UPLOAD_LIMIT) {
+            summary +=
+              `\n\nFile is ${formatBytes(sizeBytes)} (over the 4 MB inline limit). ` +
+              `Fetch the bytes via the pre-signed downloadUrl above.`;
+          }
+          blocks.push({ type: "text", text: summary });
+        }
+
+        return { content: blocks };
+      } catch (err) {
+        return errorResult("download_file", err);
       }
     }
   );
