@@ -2,15 +2,17 @@
  * Validates Microsoft Entra ID access tokens.
  *
  * We expect tokens issued by Microsoft Entra (Azure AD) for our specific
- * tenant, with an audience of Microsoft Graph. The signature is checked
- * against Microsoft's published JWKS endpoint (cached and rotated by `jose`).
+ * tenant, with an audience matching our app's client ID (the token is
+ * scoped to our MCP server, not directly to Graph). The signature is
+ * checked against Microsoft's published JWKS endpoint.
  *
- * On success we return AuthInfo with the original raw token in `extra.accessToken`
- * so individual tool handlers can pass it through to Graph.
+ * On success we return AuthInfo with the raw token in `extra.accessToken`.
+ * Tool handlers pass this token to graph(), which internally exchanges it
+ * for a Graph-audience token via the OBO flow.
  */
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { env, ISSUER, GRAPH_AUDIENCE, VERBOSE } from "./env";
+import { env, ISSUER, APP_AUDIENCE, VERBOSE } from "./env";
 
 /**
  * Microsoft's tenant-scoped JWKS endpoint. `jose` caches keys and respects
@@ -53,7 +55,7 @@ export async function verifyEntraToken(
         // v1.0 issuer format — Microsoft sometimes mixes them
         `https://sts.windows.net/${env.WCIO_MCP_TENANT_ID}/`,
       ],
-      audience: GRAPH_AUDIENCE,
+      audience: APP_AUDIENCE,
     });
 
     // Defense in depth: explicitly check tenant ID even though the issuer

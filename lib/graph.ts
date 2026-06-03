@@ -8,7 +8,8 @@
  *  2. Its auth provider pattern doesn't compose well with per-request tokens
  *  3. Direct fetch gives us better control over streaming for large uploads
  */
-import { GRAPH_BASE, VERBOSE } from "./env";
+import { GRAPH_BASE, TOKEN_ENDPOINT, VERBOSE, env } from "./env";
+import { createHash } from "crypto";
 
 export class GraphError extends Error {
   constructor(
@@ -20,6 +21,104 @@ export class GraphError extends Error {
     super(message);
     this.name = "GraphError";
   }
+}
+
+// ============================================================================
+// On-Behalf-Of (OBO) token exchange
+// ============================================================================
+// We receive a Bearer token scoped to our app (audience = our client ID).
+// To call Microsoft Graph, we need a Graph-audience token. The OBO grant
+// type exchanges the user's app-scoped token for a Graph-scoped token,
+// preserving the user's identity throughout.
+//
+// Cache strategy: in-memory keyed by SHA-256 of the incoming user token.
+// Vercel warm functions reuse this map across requests; cold starts lose
+// it and we do a fresh exchange. Tokens are cached until ~5 minutes before
+// their declared expiry to avoid races.
+
+interface CachedGraphToken {
+  graphToken: string;
+  expiresAt: number; // epoch millis
+}
+
+const graphTokenCache = new Map<string, CachedGraphToken>();
+const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+
+function cacheKey(userToken: string): string {
+  return createHash("sha256").update(userToken).digest("hex");
+}
+
+/**
+ * Exchange the user's app-scoped token for a Microsoft Graph-scoped token
+ * using OAuth 2.0 On-Behalf-Of grant. Cached per user-token for ~55 minutes.
+ *
+ * Requests Graph's `.default` scope, which yields a token containing every
+ * delegated permission our app registration has admin-consented for the
+ * user — so we don't need per-tool scope arguments.
+ *
+ * https://learn.microsoft.com/entra/identity-platform/v2-oauth2-on-behalf-of-flow
+ */
+export async function exchangeForGraphToken(userToken: string): Promise<string> {
+  const key = cacheKey(userToken);
+  const cached = graphTokenCache.get(key);
+  const now = Date.now();
+  if (cached && cached.expiresAt - TOKEN_REFRESH_BUFFER_MS > now) {
+    return cached.graphToken;
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    client_id: env.WCIO_MCP_CLIENT_ID,
+    client_secret: env.WCIO_MCP_CLIENT_SECRET,
+    assertion: userToken,
+    scope: "https://graph.microsoft.com/.default offline_access",
+    requested_token_use: "on_behalf_of",
+  });
+
+  const res = await fetch(TOKEN_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const errJson = (await res.json()) as { error?: string; error_description?: string };
+      detail = `${errJson.error ?? "unknown_error"}: ${errJson.error_description ?? ""}`;
+    } catch {
+      detail = await res.text();
+    }
+    throw new GraphError(
+      `OBO token exchange failed: ${detail}`,
+      res.status,
+      "obo_exchange_failed"
+    );
+  }
+
+  const tokenResponse = (await res.json()) as {
+    access_token: string;
+    expires_in: number;
+    token_type: string;
+  };
+
+  graphTokenCache.set(key, {
+    graphToken: tokenResponse.access_token,
+    expiresAt: now + tokenResponse.expires_in * 1000,
+  });
+
+  if (VERBOSE) {
+    console.log(`[obo] exchanged user token for Graph token, valid ${tokenResponse.expires_in}s`);
+  }
+
+  // Periodic cleanup so the cache doesn't grow unboundedly on a warm instance
+  if (graphTokenCache.size > 200) {
+    for (const [k, v] of graphTokenCache.entries()) {
+      if (v.expiresAt < now) graphTokenCache.delete(k);
+    }
+  }
+
+  return tokenResponse.access_token;
 }
 
 interface GraphErrorBody {
@@ -34,17 +133,19 @@ interface GraphErrorBody {
 }
 
 /**
- * Make a Graph API request. Returns parsed JSON on success.
- * Throws GraphError with HTTP status and Graph error code on failure.
+ * Make a Graph API request. Accepts the user's MCP-scoped Bearer token;
+ * internally exchanges it for a Graph-scoped token via OBO before calling.
+ * Returns parsed JSON on success. Throws GraphError with HTTP status on failure.
  */
 export async function graph<T = unknown>(
-  accessToken: string,
+  userToken: string,
   path: string,
   init: RequestInit = {}
 ): Promise<T> {
+  const graphToken = await exchangeForGraphToken(userToken);
   const url = path.startsWith("http") ? path : `${GRAPH_BASE}${path}`;
   const headers = new Headers(init.headers);
-  headers.set("Authorization", `Bearer ${accessToken}`);
+  headers.set("Authorization", `Bearer ${graphToken}`);
   if (!headers.has("Content-Type") && init.body && typeof init.body === "string") {
     headers.set("Content-Type", "application/json");
   }
@@ -73,7 +174,6 @@ export async function graph<T = unknown>(
     );
   }
 
-  // Some Graph endpoints return 204 No Content
   if (response.status === 204) {
     return undefined as T;
   }
@@ -82,46 +182,65 @@ export async function graph<T = unknown>(
   if (contentType.includes("application/json")) {
     return (await response.json()) as T;
   }
-  // Caller should handle non-JSON via raw fetch
   return undefined as T;
 }
 
 /**
  * Upload binary content to Graph. Used for file uploads under 4 MB.
- * For larger files, see uploadFileViaSession.
+ * Takes the user's MCP-scoped token; internally exchanges to Graph.
  */
 export async function graphPutBinary(
-  accessToken: string,
+  userToken: string,
   path: string,
   body: ArrayBuffer | Uint8Array | Blob,
   contentType: string = "application/octet-stream"
 ): Promise<unknown> {
-  return graph(accessToken, path, {
+  const graphToken = await exchangeForGraphToken(userToken);
+  const url = path.startsWith("http") ? path : `${GRAPH_BASE}${path}`;
+  const res = await fetch(url, {
     method: "PUT",
-    headers: { "Content-Type": contentType },
+    headers: {
+      Authorization: `Bearer ${graphToken}`,
+      "Content-Type": contentType,
+    },
     body: body as BodyInit,
   });
+
+  if (!res.ok) {
+    let errBody: GraphErrorBody | undefined;
+    try {
+      errBody = (await res.json()) as GraphErrorBody;
+    } catch {
+      // not JSON
+    }
+    throw new GraphError(
+      errBody?.error?.message ?? `Graph PUT returned ${res.status}`,
+      res.status,
+      errBody?.error?.code,
+      errBody?.error?.innerError?.["request-id"]
+    );
+  }
+  if (res.status === 204) return undefined;
+  return await res.json();
 }
 
 /**
  * Upload a file >4 MB using an upload session.
+ * Takes the user's MCP-scoped token; exchanges via OBO for the session-create
+ * call. The actual chunked PUTs use the temporary uploadUrl Microsoft returns,
+ * which is pre-authenticated so no token needed on those.
  *
  * https://learn.microsoft.com/graph/api/driveitem-createuploadsession
- *
- * Strategy:
- *  1. Create upload session — Graph returns an uploadUrl
- *  2. PUT chunks of up to 60 MB to that URL with Content-Range headers
- *  3. Final chunk returns the DriveItem metadata
  */
 export async function uploadFileViaSession(
-  accessToken: string,
+  userToken: string,
   uploadSessionPath: string,
   body: ArrayBuffer,
   conflictBehavior: "rename" | "replace" | "fail" = "replace"
 ): Promise<unknown> {
-  // 1. Create the upload session
+  // 1. Create the upload session (needs Graph token via OBO)
   const session = (await graph<{ uploadUrl: string }>(
-    accessToken,
+    userToken,
     uploadSessionPath,
     {
       method: "POST",
