@@ -135,6 +135,52 @@ export async function graph<T = unknown>(
 }
 
 /**
+ * Download binary content from Graph. Used by the download_file tool to read
+ * an existing file's bytes for round-trip editing.
+ *
+ * Returns the raw bytes plus the server-reported content-type so the caller
+ * can attach the correct MIME type to the MCP resource block. The Graph
+ * /content endpoints normally 302 to a pre-authenticated download URL on
+ * SharePoint storage; we follow that redirect automatically.
+ */
+export async function graphGetBinary(
+  sessionId: string,
+  path: string
+): Promise<{ bytes: Uint8Array; contentType: string }> {
+  const graphToken = await getGraphTokenForSession(sessionId);
+  const url = path.startsWith("http") ? path : `${GRAPH_BASE}${path}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${graphToken}` },
+    redirect: "follow",
+  });
+
+  if (VERBOSE) {
+    console.log(`[graph] GET ${path} (binary) → ${res.status}`);
+  }
+
+  if (!res.ok) {
+    let errBody: GraphErrorBody | undefined;
+    try {
+      errBody = (await res.json()) as GraphErrorBody;
+    } catch {
+      // not JSON
+    }
+    throw new GraphError(
+      errBody?.error?.message ?? `Graph GET (binary) returned ${res.status}`,
+      res.status,
+      errBody?.error?.code,
+      errBody?.error?.innerError?.["request-id"]
+    );
+  }
+
+  const buffer = await res.arrayBuffer();
+  return {
+    bytes: new Uint8Array(buffer),
+    contentType: res.headers.get("content-type") ?? "application/octet-stream",
+  };
+}
+
+/**
  * Upload binary content to Graph. Used for file uploads under 4 MB.
  * Takes the caller's session id; resolves it to a Graph token internally.
  */
