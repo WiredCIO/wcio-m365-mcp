@@ -16,7 +16,7 @@ import { verifyMcpToken } from "@/lib/auth";
 import { registerAllTools } from "@/lib/tools";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 800;
+export const maxDuration = 300;
 
 const handler = createMcpHandler(
   (server) => {
