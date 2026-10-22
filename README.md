@@ -49,6 +49,7 @@ Full details: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
 - `send_email` — send immediately
 - `create_draft` — leave in Drafts for user review
 - `reply_to_email` — threaded reply or reply-all, sent immediately
+- `delete_draft` — move an unsent draft to Deleted Items (recoverable); refuses anything that is not a draft
 - `create_reply_draft` — threaded reply or reply-all left unsent in Drafts for review; Outlook builds the thread, quoted history and recipients
 
 **Calendar**

@@ -371,6 +371,57 @@ export function registerMailTools(server: McpServer) {
       };
     }
   );
+
+  // ==========================================================================
+  // delete_draft
+  // ==========================================================================
+  // Lets an assistant retire a draft it wrote (for example to replace it with
+  // a revised one). Refuses anything that is not an unsent draft, and moves
+  // the draft to Deleted Items rather than deleting it, so it is recoverable.
+  server.tool(
+    "delete_draft",
+    "Move an UNSENT draft to Deleted Items, where the user can still recover " +
+      "it. Refuses any message that is not a draft, so it cannot touch received " +
+      "or sent mail. Use it to replace a draft with a revised version.",
+    {
+      draft_id: z.string().describe("Graph message ID of the draft (from create_draft or create_reply_draft)"),
+    },
+    async ({ draft_id }, { authInfo }) => {
+      const token = authInfo!.extra!.accessToken as string;
+      const path = `/me/messages/${encodeURIComponent(draft_id)}`;
+      try {
+        const msg = await graph<{ isDraft?: boolean; subject?: string }>(
+          token,
+          `${path}?$select=isDraft,subject`
+        );
+        if (msg.isDraft !== true) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Refused: message ${draft_id} is not an unsent draft, so it was left alone.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        await graph(token, `${path}/move`, {
+          method: "POST",
+          body: JSON.stringify({ destinationId: "deleteditems" }),
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Draft moved to Deleted Items (recoverable). Subject: ${msg.subject ?? ""}`,
+            },
+          ],
+        };
+      } catch (err) {
+        return errorResult("delete_draft", err);
+      }
+    }
+  );
 }
 
 function errorResult(toolName: string, err: unknown) {
