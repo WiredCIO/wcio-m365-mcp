@@ -48,7 +48,8 @@ Full details: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
 **Mail** (Outlook)
 - `send_email` — send immediately
 - `create_draft` — leave in Drafts for user review
-- `reply_to_email` — threaded reply or reply-all
+- `reply_to_email` — threaded reply or reply-all, sent immediately
+- `create_reply_draft` — threaded reply or reply-all left unsent in Drafts for review; Outlook builds the thread, quoted history and recipients
 
 **Calendar**
 - `create_event` — including Teams meeting auto-generation

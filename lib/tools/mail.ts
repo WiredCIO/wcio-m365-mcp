@@ -184,8 +184,10 @@ export function registerMailTools(server: McpServer) {
   // ==========================================================================
   server.tool(
     "reply_to_email",
-    "Reply to an email message. The reply preserves the thread and quotes the " +
-      "original message body automatically.",
+    "Reply to an email message and SEND it immediately. The reply preserves the " +
+      "thread and quotes the original message body automatically. Once sent it " +
+      "cannot be recalled, so confirm with the user first. To leave a threaded " +
+      "reply in Drafts for the user to review instead, use create_reply_draft.",
     {
       message_id: z
         .string()
@@ -231,6 +233,144 @@ export function registerMailTools(server: McpServer) {
       }
     }
   );
+
+  // ==========================================================================
+  // create_reply_draft
+  // ==========================================================================
+  // Outlook builds the reply itself (createReply / createReplyAll), so the
+  // draft carries the real thread: In-Reply-To and References headers, the
+  // conversation id, the "RE:" subject, the original recipients, and the
+  // quoted history. We then write our text in above the quoted history and
+  // optionally add recipients. Nothing is sent.
+  server.tool(
+    "create_reply_draft",
+    "Create a reply to an existing email and leave it UNSENT in the user's " +
+      "Drafts folder, threaded on the original conversation exactly as if the " +
+      "user had clicked Reply (or Reply All) in Outlook. The quoted history, " +
+      "subject and recipients come from Outlook itself. Your text goes above " +
+      "the quoted history. Optionally add To or Cc recipients. The user " +
+      "reviews, edits, sends or deletes the draft in Outlook.",
+    {
+      message_id: z
+        .string()
+        .describe(
+          "Graph message ID of the email being replied to. Usually the latest " +
+            "message in the thread (from outlook_email_search)."
+        ),
+      body_html: z
+        .string()
+        .optional()
+        .describe("HTML for the new reply text. Mutually exclusive with body_text."),
+      body_text: z
+        .string()
+        .optional()
+        .describe("Plain text for the new reply text. Mutually exclusive with body_html."),
+      reply_all: z
+        .boolean()
+        .default(false)
+        .describe("Reply to everyone on the message (true) or just the sender (false)"),
+      add_to: recipientsField.describe("Extra To recipients beyond the ones Outlook fills in"),
+      add_cc: recipientsField.describe("Extra Cc recipients beyond the ones Outlook fills in"),
+      time_zone: z
+        .string()
+        .default("Central Standard Time")
+        .describe(
+          "Windows time zone name used for the dates in the quoted header " +
+            "(e.g. 'Eastern Standard Time'). Outlook uses UTC if not set."
+        ),
+    },
+    async (
+      { message_id, body_html, body_text, reply_all, add_to, add_cc, time_zone },
+      { authInfo }
+    ) => {
+      if (!body_html && !body_text) {
+        return {
+          content: [{ type: "text", text: "Error: provide body_html or body_text" }],
+          isError: true,
+        };
+      }
+      if (body_html && body_text) {
+        return {
+          content: [
+            { type: "text", text: "Error: provide only one of body_html or body_text, not both" },
+          ],
+          isError: true,
+        };
+      }
+      const token = authInfo!.extra!.accessToken as string;
+      const endpoint = reply_all
+        ? `/me/messages/${encodeURIComponent(message_id)}/createReplyAll`
+        : `/me/messages/${encodeURIComponent(message_id)}/createReply`;
+
+      // Step 1: let Outlook build the threaded draft.
+      let draft: DraftMessage;
+      try {
+        draft = await graph<DraftMessage>(token, endpoint, {
+          method: "POST",
+          body: JSON.stringify({}),
+          headers: {
+            Prefer: `outlook.body-content-type="html", outlook.timezone="${time_zone.replace(/"/g, "")}"`,
+          },
+        });
+      } catch (err) {
+        return errorResult("create_reply_draft", err);
+      }
+
+      // Step 2: write our text above the quoted history and add recipients.
+      const newHtml = body_html ?? textToHtml(body_text!);
+      const existing = draft.body?.content ?? "";
+      const isHtml = (draft.body?.contentType ?? "html").toLowerCase() === "html";
+      const content = isHtml
+        ? insertAfterBodyTag(existing, `<div>${newHtml}</div>`)
+        : `${body_text ?? htmlToRoughText(body_html!)}\n\n${existing}`;
+
+      const patch: Record<string, unknown> = {
+        body: { contentType: isHtml ? "html" : "text", content },
+      };
+      if (add_to.length) {
+        patch.toRecipients = mergeRecipients(draft.toRecipients ?? [], toRecipients(add_to));
+      }
+      if (add_cc.length) {
+        patch.ccRecipients = mergeRecipients(draft.ccRecipients ?? [], toRecipients(add_cc));
+      }
+
+      let updated: DraftMessage;
+      try {
+        updated = await graph<DraftMessage>(token, `/me/messages/${encodeURIComponent(draft.id)}`, {
+          method: "PATCH",
+          body: JSON.stringify(patch),
+        });
+      } catch (err) {
+        // Don't leave an empty reply sitting in Drafts if we couldn't fill it.
+        try {
+          await graph(token, `/me/messages/${encodeURIComponent(draft.id)}`, { method: "DELETE" });
+        } catch {
+          // best effort
+        }
+        return errorResult("create_reply_draft", err);
+      }
+
+      const list = (rs?: GraphRecipient[]) =>
+        (rs ?? []).map((r) => r.emailAddress?.address).filter(Boolean).join(", ") || "(none)";
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Reply draft created in Drafts, not sent.\n` +
+              `Draft id: ${updated.id}\n` +
+              `Subject: ${updated.subject ?? draft.subject ?? ""}\n` +
+              `To: ${list(updated.toRecipients)}\n` +
+              `Cc: ${list(updated.ccRecipients)}\n` +
+              `Conversation id: ${updated.conversationId ?? draft.conversationId ?? ""}` +
+              (updated.webLink ?? draft.webLink
+                ? `\nOpen: ${updated.webLink ?? draft.webLink}`
+                : ""),
+          },
+        ],
+      };
+    }
+  );
 }
 
 function errorResult(toolName: string, err: unknown) {
@@ -252,4 +392,71 @@ function errorResult(toolName: string, err: unknown) {
     content: [{ type: "text" as const, text: `Error in ${toolName}: ${msg}` }],
     isError: true,
   };
+}
+
+// ============================================================================
+// Reply-draft helpers
+// ============================================================================
+
+interface GraphRecipient {
+  emailAddress?: { address?: string; name?: string };
+}
+
+interface DraftMessage {
+  id: string;
+  subject?: string;
+  conversationId?: string;
+  webLink?: string;
+  body?: { contentType?: string; content?: string };
+  toRecipients?: GraphRecipient[];
+  ccRecipients?: GraphRecipient[];
+}
+
+function escapeHtml(s: string) {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** Plain text to simple HTML: paragraphs on blank lines, <br> on single breaks. */
+export function textToHtml(text: string) {
+  return text
+    .replace(/\r\n/g, "\n")
+    .split(/\n{2,}/)
+    .map((para) => `<p>${escapeHtml(para).replace(/\n/g, "<br>")}</p>`)
+    .join("");
+}
+
+function htmlToRoughText(html: string) {
+  return html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<[^>]+>/g, "")
+    .trim();
+}
+
+/** Put new content directly after the opening <body> tag, above the quoted history. */
+export function insertAfterBodyTag(html: string, insert: string) {
+  const m = /<body[^>]*>/i.exec(html);
+  if (!m) return insert + html;
+  const at = m.index + m[0].length;
+  return html.slice(0, at) + insert + html.slice(at);
+}
+
+/** Existing recipients first, then any new ones not already present. */
+export function mergeRecipients(existing: GraphRecipient[], extra: GraphRecipient[]) {
+  const seen = new Set(
+    existing.map((r) => r.emailAddress?.address?.toLowerCase()).filter(Boolean) as string[]
+  );
+  const out = [...existing];
+  for (const r of extra) {
+    const a = r.emailAddress?.address?.toLowerCase();
+    if (a && !seen.has(a)) {
+      seen.add(a);
+      out.push(r);
+    }
+  }
+  return out;
 }
