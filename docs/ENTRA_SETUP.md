@@ -43,6 +43,9 @@ The MCP server uses delegated Microsoft Graph permissions so every action runs u
    - `Calendars.ReadWrite` — read and write the user's calendar
    - `OnlineMeetings.ReadWrite` — required to create Teams meeting links via create_event
 
+   **Contacts**
+   - `Contacts.ReadWrite` — create and update the user's Outlook contact cards (upsert_contacts, find_contacts)
+
    **Teams**
    - `Chat.ReadWrite` — read and post into the user's chats
    - `ChannelMessage.Send` — post into team channels the user is a member of

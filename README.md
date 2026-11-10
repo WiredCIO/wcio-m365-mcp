@@ -57,6 +57,10 @@ Full details: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
 - `update_event` — partial updates by field
 - `cancel_event` — sends cancellation notice
 
+**Contacts** (Outlook)
+- `upsert_contacts` — create or update up to 50 contact cards per call, matched by email; only the fields sent are written, categories are added never removed
+- `find_contacts` — look up cards by email, or list a category
+
 **Teams**
 - `post_chat_message` — 1:1 or group chat
 - `post_channel_message` — to a team channel
