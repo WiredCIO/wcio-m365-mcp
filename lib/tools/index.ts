@@ -8,10 +8,12 @@ import { registerFileTools } from "./files";
 import { registerMailTools } from "./mail";
 import { registerCalendarTools } from "./calendar";
 import { registerTeamsTools } from "./teams";
+import { registerContactTools } from "./contacts";
 
 export function registerAllTools(server: McpServer) {
   registerFileTools(server);
   registerMailTools(server);
   registerCalendarTools(server);
   registerTeamsTools(server);
+  registerContactTools(server);
 }
